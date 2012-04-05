@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace DCPU16Sharp
 {
@@ -17,6 +18,7 @@ namespace DCPU16Sharp
         public DCPU16()
         {
             Paused = true;
+            loopTask = new Task(() => loop());
         }
 
         //+ - helper methods
@@ -25,11 +27,7 @@ namespace DCPU16Sharp
             Paused = false;
 
             // infinite loop
-            while (true)
-            {
-                if (!Paused) tick();
-                Thread.Sleep(1); // simulate CPU at 1kHz
-            }
+            loopTask.Start();
         }
 
         public void Stop()
@@ -42,12 +40,17 @@ namespace DCPU16Sharp
             Paused = !Paused; // invert pause as in a start stop thingy
         }
 
+        public void Step()
+        {
+            tick();
+        }
+
         public void SetMemory(ushort[] array)
         {
             if (array.Length > 0x10000)
                 return;
 
-            array.CopyTo(ram, 0);
+            ram.WriteImage(array);
         }
 
         //+ - public properties
@@ -55,7 +58,7 @@ namespace DCPU16Sharp
 
         //+ - Registers and RAM
         #region Registers and RAM
-        private ushort[] ram = new ushort[0x10000];  /* 64KB of ram */
+        private Memory ram = new Memory();  /* 64KB of ram */
 
         private ushort a = 0x0000;                  /* register A */
         private ushort b = 0x0000;                  /* register B */
@@ -73,115 +76,136 @@ namespace DCPU16Sharp
 
         //+ - "physical" properties of the CPU
         #region "physical" properties of the CPU
-        private double cpuclock = 1 / 1000000;      /* time a tick needs at least to execute, default 1Mhz */
+        private double cpuclock = 1 / 100000;      /* time a tick needs at least to execute, default 100kHz */
         private ushort opcode = 0x0000;
         private byte opcodestep = 0x00;
         private bool skipinstruction;
 
         private ushort addressA = 0x0000;
         private ushort addressB = 0x0000;
+
+        private Task loopTask;
+        private object ticklock = new object();
         #endregion
 
         //+ - simulate tick
         private void tick()
         {
-            // fetch new opcode
-            opcode = ram[pc++];
-
-            // read the rest of the instruction ahead of time
-            int valuea = ReadA();
-            int valueb = ReadB();
-            int temp = 0;
-
-            // check if we had a jump etc.
-            if (skipinstruction)
+            lock (ticklock)
             {
-                skipinstruction = false;
-                return;
+                // fetch new opcode
+                opcode = ram[pc++];
+
+                // read the rest of the instruction ahead of time
+                int valuea = ReadA();
+                int valueb = ReadB();
+                int temp = 0;
+
+                // check if we had a jump etc.
+                if (skipinstruction)
+                {
+                    skipinstruction = false;
+                    return;
+                }
+
+                // parse opcode
+                switch (opcode & 0x000F)
+                {
+                    case 0x0000: /* non-basic instruction */
+                        // valueb contains opcode
+                        switch ((opcode >> 4) & 0x3F)
+                        {
+                            case 0x01: /* JSR a - pushes the address of the next instruction to the stack, then sets PC to a */
+                                Push(pc++);
+                                pc = (ushort)valueb;
+                                break;
+                            default:
+                                break;
+                        }
+                        break;
+
+                    case 0x0001: /* SET a, b - sets a to b */
+                        WriteA(valueb); break;
+
+                    case 0x0002: /* ADD a, b - sets a to a+b, sets O to 0x0001 if there's an overflow, 0x0 otherwise */
+                        temp = valuea + valueb;
+                        o = ((temp >> 16) > 0) ? (ushort)0x0001 : (ushort)0x0000;
+                        WriteA(temp);
+                        break;
+                    case 0x0003: /* SUB a, b - sets a to a-b, sets O to 0xffff if there's an underflow, 0x0 otherwise */
+                        temp = valuea - valueb;
+                        o = (temp < 0) ? (ushort)0xFFFF : (ushort)0x0000;
+                        WriteA(temp);
+                        break;
+                    case 0x0004: /* MUL a, b - sets a to a*b, sets O to ((a*b)>>16)&0xffff */
+                        temp = valuea * valueb;
+                        o = (ushort)((temp >> 16) & 0xFFFF);
+                        WriteA(temp);
+                        break;
+                    case 0x0005: /* DIV a, b - sets a to a/b, sets O to ((a<<16)/b)&0xffff. if b==0, sets a and O to 0 instead. */
+                        if (valueb == 0) { WriteA(0); o = 0; }
+                        else
+                            WriteA(valuea / valueb);
+                        break;
+                    case 0x0006: /* MOD a, b - sets a to a%b. if b==0, sets a to 0 instead. */
+                        WriteA(valueb == 0 ? 0x0000 : valuea % valueb);
+                        break;
+
+                    case 0x0007: /* SHL a, b - sets a to a<<b, sets O to ((a<<b)>>16)&0xffff */
+                        WriteA(valuea << valueb);
+                        o = (ushort)(((valuea << valueb) >> 16) & 0xFFFF);
+                        break;
+                    case 0x0008: /* SHR a, b - sets a to a>>b, sets O to ((a<<16)>>b)&0xffff */
+                        WriteA(valuea >> valueb);
+                        o = (ushort)(((valuea << 16) >> valueb) & 0xFFFF);
+                        break;
+
+                    case 0x0009: /* AND a, b - sets a to a&b */
+                        WriteA(valuea & valueb);
+                        break;
+                    case 0x000A: /* BOR a, b - sets a to a|b */
+                        WriteA(valuea | valueb);
+                        break;
+                    case 0x000B: /* XOR a, b - sets a to a^b */
+                        WriteA(valuea ^ valueb);
+                        break;
+
+                    case 0x000C: /* IFE a, b - performs next instruction only if a==b */
+                        if (valuea == valueb) ;
+                        else
+                            skipinstruction = true;
+                        break;
+                    case 0x000D: /* IFN a, b - performs next instruction only if a!=b */
+                        if (valuea != valueb) ;
+                        else
+                            skipinstruction = true;
+                        break;
+                    case 0x000E: /* IFG a, b - performs next instruction only if a>b */
+                        if (valuea > valueb) ;
+                        else
+                            skipinstruction = true;
+                        break;
+                    case 0x000F: /* IFB a, b - performs next instruction only if (a&b)!=0 */
+                        if ((valuea & valueb) != 0) ;
+                        else
+                            skipinstruction = true;
+                        break;
+                }
             }
+        }
 
-            // parse opcode
-            switch (opcode & 0x000F)
+        public void loop()
+        {
+            
+            while (true)
             {
-                case 0x0000: /* non-basic instruction */
-                    // valueb contains opcode
-                    switch ((opcode >> 4) & 0x3F)
-                    {
-                        case 0x01: /* JSR a - pushes the address of the next instruction to the stack, then sets PC to a */
-                            Push(pc++);
-                            pc = (ushort)valueb;
-                            break;
-                        default:
-                            break;
-                    }
-                    break;
+                
+                if (Paused)
+                    Thread.Sleep(100);
 
-                case 0x0001: /* SET a, b - sets a to b */
-                    WriteA(valueb); break;
+                tick();
 
-                case 0x0002: /* ADD a, b - sets a to a+b, sets O to 0x0001 if there's an overflow, 0x0 otherwise */
-                    temp = valuea + valueb;
-                    o = ((temp >> 16) > 0) ? (ushort)0x0001 : (ushort)0x0000;
-                    WriteA(temp);
-                    break;
-                case 0x0003: /* SUB a, b - sets a to a-b, sets O to 0xffff if there's an underflow, 0x0 otherwise */
-                    temp = valuea - valueb;
-                    o = (temp < 0) ? (ushort)0xFFFF : (ushort)0x0000;
-                    WriteA(temp);
-                    break;
-                case 0x0004: /* MUL a, b - sets a to a*b, sets O to ((a*b)>>16)&0xffff */
-                    temp = valuea * valueb;
-                    o = (ushort)((temp >> 16) & 0xFFFF);
-                    WriteA(temp);
-                    break;
-                case 0x0005: /* DIV a, b - sets a to a/b, sets O to ((a<<16)/b)&0xffff. if b==0, sets a and O to 0 instead. */
-                    if (valueb == 0) { WriteA(0); o = 0; }
-                    else
-                        WriteA(valuea / valueb);
-                    break;
-                case 0x0006: /* MOD a, b - sets a to a%b. if b==0, sets a to 0 instead. */
-                    WriteA(valueb == 0 ? 0x0000 : valuea % valueb);
-                    break;
-
-                case 0x0007: /* SHL a, b - sets a to a<<b, sets O to ((a<<b)>>16)&0xffff */
-                    WriteA(valuea << valueb);
-                    o = (ushort)(((valuea << valueb) >> 16) & 0xFFFF);
-                    break;
-                case 0x0008: /* SHR a, b - sets a to a>>b, sets O to ((a<<16)>>b)&0xffff */
-                    WriteA(valuea >> valueb);
-                    o = (ushort)(((valuea << 16) >> valueb) & 0xFFFF);
-                    break;
-
-                case 0x0009: /* AND a, b - sets a to a&b */
-                    WriteA(valuea & valueb);
-                    break;
-                case 0x000A: /* BOR a, b - sets a to a|b */
-                    WriteA(valuea | valueb);
-                    break;
-                case 0x000B: /* XOR a, b - sets a to a^b */
-                    WriteA(valuea ^ valueb);
-                    break;
-
-                case 0x000C: /* IFE a, b - performs next instruction only if a==b */
-                    if (valuea == valueb) ;
-                    else
-                        skipinstruction = true;
-                    break;
-                case 0x000D: /* IFN a, b - performs next instruction only if a!=b */
-                    if (valuea != valueb) ;
-                    else
-                        skipinstruction = true;
-                    break;
-                case 0x000E: /* IFG a, b - performs next instruction only if a>b */
-                    if (valuea > valueb) ;
-                    else
-                        skipinstruction = true;
-                    break;
-                case 0x000F: /* IFB a, b - performs next instruction only if (a&b)!=0 */
-                    if ((valuea & valueb) != 0) ;
-                    else
-                        skipinstruction = true;
-                    break;
+                Thread.Sleep(1);
             }
         }
 
