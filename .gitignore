@@ -1,0 +1,11 @@
+
+/DCPU16Sharp/obj
+/DCPU16Sharp/bin
+/TestApplication/obj
+/TestApplication/bin
+/DCPU-16 Sharp.sln.docstates.suo
+*.suo
+/packages
+/Test Machine/obj
+/Test Machine/bin
+/Test Machine/packages.config
